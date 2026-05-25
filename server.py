@@ -2,26 +2,45 @@ import io
 import zipfile
 import traceback
 import requests
+
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse, JSONResponse
 
 app = FastAPI()
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
 
-NO_PROXIES = {"http": None, "https": None}
+
+def safe_get(url, timeout=20):
+    try:
+        return requests.get(url, headers=HEADERS, timeout=timeout)
+    except Exception as e:
+        print("REQUEST ERROR:", url, e)
+        return None
 
 
-def detect_branch(owner, repo):
-    """Авто-определение main/master"""
-    url = f"https://api.github.com/repos/{owner}/{repo}"
-    r = requests.get(url, headers=HEADERS, timeout=20)
+def get_git_tree(owner, repo):
+    for branch in ["master", "main"]:
+        url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
 
-    if r.status_code != 200:
-        return "main"
+        res = safe_get(url)
+        if res and res.status_code == 200:
+            return res.json().get("tree", []), branch
 
-    data = r.json()
-    return data.get("default_branch", "main")
+    return None, None
+
+
+def get_raw_file(owner, repo, branch, path):
+    for br in [branch, "main", "master"]:
+        url = f"https://raw.githubusercontent.com/{owner}/{repo}/{br}/{path}"
+        res = safe_get(url)
+
+        if res and res.status_code == 200:
+            return res
+
+    return None
 
 
 @app.get("/")
@@ -33,24 +52,17 @@ def home():
 def create_zip(path: str, owner: str, repo: str):
 
     try:
-        print(f"ZIP REQUEST: {path}")
+        print(f"ZIP REQUEST: {owner}/{repo} -> {path}")
 
-        zip_buffer = io.BytesIO()
+        tree, branch = get_git_tree(owner, repo)
 
-        branch = detect_branch(owner, repo)
-
-        tree_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
-
-        response = requests.get(tree_url, headers=HEADERS, proxies=NO_PROXIES, timeout=120)
-
-        if response.status_code != 200:
+        if not tree:
             return JSONResponse(
-                {"error": "github_api_error", "status": response.status_code},
+                {"error": "github_api_error"},
                 status_code=500
             )
 
-        tree = response.json().get("tree", [])
-
+        zip_buffer = io.BytesIO()
         added = 0
 
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
@@ -66,11 +78,9 @@ def create_zip(path: str, owner: str, repo: str):
                     if not item_path.startswith(path + "/"):
                         continue
 
-                    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{item_path}"
+                    file_res = get_raw_file(owner, repo, branch, item_path)
 
-                    file_res = requests.get(raw_url, headers=HEADERS, timeout=120)
-
-                    if file_res.status_code != 200:
+                    if not file_res:
                         continue
 
                     archive_name = item_path.replace(path + "/", "")
@@ -83,18 +93,30 @@ def create_zip(path: str, owner: str, repo: str):
                     continue
 
         if added == 0:
-            return JSONResponse({"error": "empty_folder"}, status_code=404)
+            return JSONResponse(
+                {"error": "empty_folder"},
+                status_code=404
+            )
 
         zip_buffer.seek(0)
 
         filename = path.split("/")[-1] + ".zip"
 
+        print(f"ZIP READY: {filename}")
+
         return StreamingResponse(
             zip_buffer,
             media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}"
+            }
         )
 
-    except Exception:
+    except Exception as e:
+        print("CRITICAL ERROR:")
         traceback.print_exc()
-        return JSONResponse({"error": "server_crash"}, status_code=500)
+
+        return JSONResponse(
+            {"error": str(e)},
+            status_code=500
+        )
